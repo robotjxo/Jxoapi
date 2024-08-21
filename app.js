@@ -1,4 +1,5 @@
 const express = require("express");
+const path = require("path");
 const bodyParser = require("body-parser");
 const axios = require("axios");
 const https = require("https");
@@ -24,6 +25,7 @@ let oaiDeviceId;
 // Function to wait for a specified duration
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Function to generate a unique completion ID
 function GenerateCompletionId(prefix = "cmpl-") {
   const characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   const length = 28;
@@ -35,6 +37,7 @@ function GenerateCompletionId(prefix = "cmpl-") {
   return prefix;
 }
 
+// Async generator to handle chunked responses and extract lines
 async function* chunksToLines(chunksAsync) {
   let previous = "";
   for await (const chunk of chunksAsync) {
@@ -51,6 +54,7 @@ async function* chunksToLines(chunksAsync) {
   }
 }
 
+// Async generator to extract messages from lines
 async function* linesToMessages(linesAsync) {
   for await (const line of linesAsync) {
     const message = line.substring("data :".length);
@@ -59,6 +63,7 @@ async function* linesToMessages(linesAsync) {
   }
 }
 
+// Async generator to stream completion responses
 async function* StreamCompletion(data) {
   yield* linesToMessages(chunksToLines(data));
 }
@@ -85,6 +90,7 @@ const axiosInstance = axios.create({
   },
 });
 
+// Function to generate proof token for authentication
 function generateProofToken(seed, diff, userAgent) {
   const cores = [8, 12, 16, 24];
   const screens = [3000, 4000, 6000];
@@ -224,178 +230,127 @@ async function handleChatCompletion(req, res) {
 
     for await (const message of StreamCompletion(response.data)) {
       // Skip heartbeat detection
-      if (message.match(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.\d{6}$/))
+      if (message.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/)) {
         continue;
-
-      const parsed = JSON.parse(message);
-
-      if (parsed.error) {
-        error = `Error message from OpenAI: ${parsed.error}`;
-        finish_reason = "stop";
-        break;
       }
 
-      let content = parsed?.message?.content?.parts[0] ?? "";
-      let status = parsed?.message?.status ?? "";
+      const delta = JSON.parse(message);
+      if (delta.error) {
+        error = delta.error.message || "An error occurred.";
+        console.error("System: Error during chat completion: ", error);
+        return res.status(500).send({
+          status: false,
+          error: {
+            message: `An error occurred during chat completion: ${error}. Please open an issue on the GitHub repository.`,
+            type: "completion_error",
+          },
+        });
+      }
 
-      for (let message of req.body.messages) {
-        if (message.content === content) {
-          content = "";
-          break;
+      finish_reason = delta.finish_reason || null;
+      let content = delta.message?.content?.parts?.[0];
+
+      if (content) {
+        completionTokens += encode(content).length;
+        fullContent += content;
+        if (req.body.stream) {
+          res.write(
+            JSON.stringify({
+              created: created,
+              id: requestId,
+              model: "text-davinci-002-render-sha",
+              object: "chat.completion.chunk",
+              choices: [
+                {
+                  delta: { content: content },
+                  index: 0,
+                  finish_reason: null,
+                },
+              ],
+            })
+          );
         }
       }
-
-      switch (status) {
-        case "in_progress":
-          finish_reason = null;
-          break;
-        case "finished_successfully":
-          let finish_reason_data =
-            parsed?.message?.metadata?.finish_details?.type ?? null;
-          switch (finish_reason_data) {
-            case "max_tokens":
-              finish_reason = "length";
-              break;
-            case "stop":
-            default:
-              finish_reason = "stop";
-          }
-          break;
-        default:
-          finish_reason = null;
-      }
-
-      if (content === "") continue;
-
-      let completionChunk = content.replace(fullContent, "");
-
-      completionTokens += encode(completionChunk).length;
-
-      if (req.body.stream) {
-        let response = {
-          id: requestId,
-          created: created,
-          object: "chat.completion.chunk",
-          model: "gpt-3.5-turbo",
-          choices: [
-            {
-              delta: {
-                content: completionChunk,
-              },
-              index: 0,
-              finish_reason: finish_reason,
-            },
-          ],
-        };
-
-        res.write(`data: ${JSON.stringify(response)}\n\n`);
-      }
-
-      fullContent = content.length > fullContent.length ? content : fullContent;
     }
-
-    if (req.body.stream) {
-      res.write(
-        `data: ${JSON.stringify({
-          id: requestId,
-          created: created,
-          object: "chat.completion.chunk",
-          model: "gpt-3.5-turbo",
-          choices: [
-            {
-              delta: {
-                content: error ?? "",
+    if (!req.body.stream) {
+      res.json({
+        id: requestId,
+        object: "chat.completion",
+        created: created,
+        model: "text-davinci-002-render-sha",
+        usage: {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+        },
+        choices: [
+          {
+            message: {
+              author: { role: "assistant" },
+              content: {
+                content_type: "text",
+                parts: [fullContent],
               },
-              index: 0,
-              finish_reason: finish_reason,
             },
-          ],
-        })}\n\n`
-      );
+            finish_reason: finish_reason,
+            index: 0,
+          },
+        ],
+      });
     } else {
       res.write(
         JSON.stringify({
-          id: requestId,
           created: created,
-          model: "gpt-3.5-turbo",
-          object: "chat.completion",
+          id: requestId,
+          model: "text-davinci-002-render-sha",
+          object: "chat.completion.chunk",
           choices: [
             {
-              finish_reason: finish_reason,
+              delta: {},
               index: 0,
-              message: {
-                content: error ?? fullContent,
-                role: "assistant",
-              },
+              finish_reason: finish_reason ?? "stop",
             },
           ],
-          usage: {
-            prompt_tokens: promptTokens,
-            completion_tokens: completionTokens,
-            total_tokens: promptTokens + completionTokens,
-          },
         })
       );
+      res.end();
     }
-
-    res.end();
   } catch (error) {
-    if (!res.headersSent) res.setHeader("Content-Type", "application/json");
-    res.write(
-      JSON.stringify({
-        status: false,
-        error: {
-          message:
-            "An error occurred. Please try again. Additionally, ensure that your request complies with OpenAI's policy.",
-          type: "invalid_request_error",
-        },
-      })
-    );
-    res.end();
+    console.error("System: Error occurred:", error);
+    res.status(500).send({
+      status: false,
+      error: {
+        message: `An error occurred: ${error.message}. Please try again later.`,
+        type: "request_error",
+      },
+    });
   }
 }
 
-// Initialize Express app and use middlewares
+// Initialize the Express application and setup routes
 const app = express();
+
+// Enable body parsing middleware
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
+// Enable CORS middleware
 app.use(enableCORS);
 
-// Route to handle POST requests for chat completions
-app.post("/v1/chat/completions", handleChatCompletion);
+// Serve static files from the "public" directory
+app.use(express.static(path.join(__dirname, 'public')));
 
-// 404 handler for unmatched routes
-app.use((req, res) =>
-  res.status(404).send({
-    status: false,
-    error: {
-      message: `The requested endpoint (${req.method.toLocaleUpperCase()} ${req.path}) was not found. https://github.com/missuo/FreeGPT35`,
-      type: "invalid_request_error",
-    },
-  })
-);
+// Route to serve the index.html file
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
-// Start the server and the session ID refresh loop
+// POST route for chat completions
+app.post("/chat/completions", handleChatCompletion);
+
+// Start the Express server and listen on the specified port
 app.listen(port, async () => {
-  console.log(`💡 Server is running at http://localhost:${port}`);
-  console.log();
-  console.log(`🔗 Local Base URL: http://localhost:${port}/v1`);
-  console.log(`🔗 Local Endpoint: http://localhost:${port}/v1/chat/completions`);
-  console.log();
-  console.log("📝 Original TS Source By: Pawan.Krd");
-  console.log("📝 Modified By: Vincent");
-  console.log();
-
-  setTimeout(async () => {
-    while (true) {
-      try {
-        await getNewSession();
-        await wait(refreshInterval);
-      } catch (error) {
-        console.error("Error refreshing session ID, retrying in 2 minute...");
-        console.error("If this error persists, your country may not be supported yet.");
-        console.error("If your country was the issue, please consider using a U.S. VPN.");
-        await wait(errorWait);
-      }
-    }
-  }, 0);
+  console.log(`System: Server started on port ${port}`);
+  console.log("System: Refreshing session ID and token...");
+  await getNewSession();
 });
